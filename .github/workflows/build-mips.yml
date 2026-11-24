@@ -68,7 +68,7 @@ jobs:
               return s.replace(a,b)
           s=replace(s,'static retro_audio_sample_batch_t  audio_batch_cb', 'static retro_audio_sample_t cubegm_sample_cb = NULL;\nstatic retro_audio_sample_batch_t  audio_batch_cb')
           s=replace(s,'void retro_set_audio_sample(retro_audio_sample_t cb) { }','void retro_set_audio_sample(retro_audio_sample_t cb) { cubegm_sample_cb = cb; }')
-          helper='static void cubegm_audio(const int16_t *buffer, size_t frames) {\n size_t i, consumed = 0;\n if (audio_batch_cb) consumed = audio_batch_cb(buffer, frames);\n if (cubegm_sample_cb && consumed < frames) for (i=consumed;i<frames;i++) cubegm_sample_cb(buffer[2*i],buffer[2*i+1]);\n}\n'
+          helper='static void cubegm_audio(const int16_t *buffer, size_t frames) {\n size_t i, consumed = 0;\n if (!cubegm_sample_cb && audio_batch_cb) consumed = audio_batch_cb(buffer, frames);\n if (cubegm_sample_cb && consumed < frames) for (i=consumed;i<frames;i++) cubegm_sample_cb(buffer[2*i],buffer[2*i+1]);\n}\n'
           s=replace(s,'int osd_update_audio_stream(int16_t *buffer)',helper+'int osd_update_audio_stream(int16_t *buffer)')
           s=replace(s,'audio_batch_cb(buffer, samples_per_frame);','cubegm_audio(buffer, samples_per_frame);')
           s=replace(s,'audio_batch_cb(samples_buffer, samples_per_frame);','cubegm_audio(samples_buffer, samples_per_frame);')
@@ -78,8 +78,25 @@ jobs:
           # Keep RGB565, which is the normal 16-bit output, but disable the newer
           # direct software framebuffer negotiation and use the normal copied frame.
           s=replace(s,'if (sw_framebuffer_supported == 0)','if (1)')
-          # Force a fresh palette every delivered frame to avoid stale palette data.
-          s=replace(s,'rebuild_palette_565(display->game_palette, display->game_palette_entries);','rebuild_palette_565(display->game_palette, display->game_palette_entries);')
+          # Convert RGB565 to the legacy libretro default 0RGB1555 at delivery.
+          # Keep the internal MAME palette and renderer unchanged.
+          s=replace(s,'color_mode = RETRO_PIXEL_FORMAT_RGB565;', 'color_mode = RETRO_PIXEL_FORMAT_0RGB1555;')
+          s=replace(s,'extern retro_video_refresh_t video_cb;', '''extern retro_video_refresh_t video_cb;
+          static uint16_t cubegm_pixels[512*512];
+          static void cubegm_video(const void *data, unsigned w, unsigned h, size_t pitch) {
+             unsigned x,y;
+             if (!data || w>512 || h>512) { video_cb(data,w,h,pitch); return; }
+             for(y=0;y<h;y++) {
+                const uint16_t *row=(const uint16_t*)((const char*)data+y*pitch);
+                for(x=0;x<w;x++) {
+                   uint16_t c=row[x];
+                   cubegm_pixels[y*w+x]=((c & 0xffc0)>>1)|(c & 0x001f);
+                }
+             }
+             video_cb(cubegm_pixels,w,h,w*2);
+          }''')
+          s=replace(s,'video_cb(direct_out, vis_width, vis_height, direct_out_pitch);','cubegm_video(direct_out, vis_width, vis_height, direct_out_pitch);')
+          s=replace(s,'video_cb(out, vis_width, vis_height, out_pitch);','if (video_stride_out == 2) cubegm_video(out, vis_width, vis_height, out_pitch); else video_cb(out, vis_width, vis_height, out_pitch);')
           p.write_text(s)
           PY
       - name: Compile baseline
@@ -128,5 +145,5 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: mame2003-cubegm-av-v011-experimental
+          name: mame2003-cubegm-av-v012-experimental
           path: output/
