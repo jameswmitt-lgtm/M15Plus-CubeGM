@@ -1,0 +1,99 @@
+name: Diagnose Battletoads AV
+on:
+  push:
+    paths: ['.github/workflows/diagnose-av.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  diagnostic:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-mipsel-linux-gnu libc6-dev-mipsel-cross qemu-user
+      - name: Fetch pinned upstream
+        run: |
+          git clone https://github.com/libretro/mame2003-libretro.git upstream
+          git -C upstream checkout 6db8b53
+      - name: Build native and MIPS reference cores
+        run: |
+          mkdir -p output
+          make -C upstream -j2 platform=unix ARCH=x86_64 CC='gcc -fcommon' > /tmp/native.log 2>&1 || { tail -80 /tmp/native.log; exit 1; }
+          cp upstream/mame2003_libretro.so output/native.so
+          make -C upstream clean
+          make -C upstream -j2 platform=unix ARCH=mips CPU_ARCH=mips CC='mipsel-linux-gnu-gcc -march=mips32r2 -mabi=32 -mhard-float -mfp32 -fcommon -static-libgcc' AR=mipsel-linux-gnu-ar > /tmp/mips.log 2>&1 || { tail -80 /tmp/mips.log; exit 1; }
+          cp upstream/mame2003_libretro.so output/mips.so
+      - name: Build capture frontend
+        run: |
+          cat > /tmp/capture.c <<'EOF'
+          #include <stdint.h>
+          #include <stdbool.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <dlfcn.h>
+          #include "libretro.h"
+          static unsigned frame, format, video_frames;
+          static unsigned long long samples, nonzero;
+          static FILE *pcm;
+          static const char *dir=".";
+          static void logger(enum retro_log_level level,const char *fmt,...) {(void)level;(void)fmt;}
+          static bool env(unsigned cmd,void *data) {
+            switch(cmd) {
+              case RETRO_ENVIRONMENT_SET_PIXEL_FORMAT: format=*(unsigned*)data; fprintf(stderr,"pixel format %u\n",format); return true;
+              case RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY:
+              case RETRO_ENVIRONMENT_GET_SAVE_DIRECTORY:
+              case RETRO_ENVIRONMENT_GET_CONTENT_DIRECTORY: *(const char**)data=dir; return true;
+              case RETRO_ENVIRONMENT_GET_LOG_INTERFACE: ((struct retro_log_callback*)data)->log=logger; return true;
+              case RETRO_ENVIRONMENT_GET_CAN_DUPE: *(bool*)data=true; return true;
+              case RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE: *(bool*)data=false; return true;
+              case RETRO_ENVIRONMENT_GET_VARIABLE: ((struct retro_variable*)data)->value=NULL; return false;
+              default: return false;
+            }
+          }
+          static void video(const void *data,unsigned w,unsigned h,size_t pitch) {
+            unsigned x,y; char path[128]; FILE *f;
+            if(!data) return;
+            video_frames++;
+            if(frame%300!=0) return;
+            snprintf(path,sizeof(path),"frame-%04u.ppm",frame);
+            f=fopen(path,"wb"); if(!f)return;
+            fprintf(f,"P6\n%u %u\n255\n",w,h);
+            for(y=0;y<h;y++)for(x=0;x<w;x++){
+              const uint8_t *row=(const uint8_t*)data+y*pitch;
+              unsigned r,g,b;
+              if(format==RETRO_PIXEL_FORMAT_XRGB8888){uint32_t c;memcpy(&c,row+4*x,4);r=(c>>16)&255;g=(c>>8)&255;b=c&255;}
+              else {uint16_t c;memcpy(&c,row+2*x,2);r=((c>>(format==RETRO_PIXEL_FORMAT_RGB565?11:10))&31)*255/31;g=((c>>5)&(format==RETRO_PIXEL_FORMAT_RGB565?63:31))*255/(format==RETRO_PIXEL_FORMAT_RGB565?63:31);b=(c&31)*255/31;}
+              fputc(r,f);fputc(g,f);fputc(b,f);
+            }
+            fclose(f);
+          }
+          static size_t batch(const int16_t *p,size_t n){size_t i;for(i=0;i<n*2;i++)if(p[i])nonzero++;samples+=n; if(pcm)fwrite(p,4,n,pcm);return n;}
+          static void audio(int16_t l,int16_t r){int16_t p[2]={l,r};batch(p,1);}
+          static void poll(void){}
+          static int16_t input(unsigned p,unsigned d,unsigned i,unsigned id){(void)i;if(p||d!=RETRO_DEVICE_JOYPAD)return 0;return (id==RETRO_DEVICE_ID_JOYPAD_SELECT && frame>=600&&frame<610)||(id==RETRO_DEVICE_ID_JOYPAD_START&&frame>=660&&frame<670)||(id==RETRO_DEVICE_ID_JOYPAD_B&&frame>700&&frame%30<10);}
+          #define LOAD(name,type) type name = dlsym(h,#name); if(!name){fprintf(stderr,"missing %s\n",#name);return 2;}
+          int main(int argc,char **argv){
+            if(argc!=3)return 1;
+            void *h=dlopen(argv[1],RTLD_NOW|RTLD_LOCAL);if(!h){fprintf(stderr,"%s\n",dlerror());return 2;}
+            typedef void(*voidfn)(void);typedef void(*envfn)(retro_environment_t);typedef void(*vidfn)(retro_video_refresh_t);typedef void(*audfn)(retro_audio_sample_t);typedef void(*batchfn)(retro_audio_sample_batch_t);typedef void(*pollfn)(retro_input_poll_t);typedef void(*inputfn)(retro_input_state_t);typedef bool(*loadfn)(const struct retro_game_info*);typedef void(*avfn)(struct retro_system_av_info*);
+            LOAD(retro_set_environment,envfn);LOAD(retro_set_video_refresh,vidfn);LOAD(retro_set_audio_sample,audfn);LOAD(retro_set_audio_sample_batch,batchfn);LOAD(retro_set_input_poll,pollfn);LOAD(retro_set_input_state,inputfn);LOAD(retro_init,voidfn);LOAD(retro_load_game,loadfn);LOAD(retro_get_system_av_info,avfn);LOAD(retro_run,voidfn);LOAD(retro_unload_game,voidfn);LOAD(retro_deinit,voidfn);
+            retro_set_environment(env);retro_set_video_refresh(video);retro_set_audio_sample(audio);retro_set_audio_sample_batch(batch);retro_set_input_poll(poll);retro_set_input_state(input);retro_init();
+            struct retro_game_info game={.path=argv[2]};if(!retro_load_game(&game)){fprintf(stderr,"ROM load failed\n");return 3;}
+            struct retro_system_av_info av={0};retro_get_system_av_info(&av);printf("fps=%f sample_rate=%f\n",av.timing.fps,av.timing.sample_rate);
+            pcm=fopen("audio.s16le","wb");for(frame=0;frame<1800;frame++)retro_run();if(pcm)fclose(pcm);
+            printf("video_frames=%u audio_frames=%llu nonzero_samples=%llu\n",video_frames,samples,nonzero);
+            retro_unload_game();retro_deinit();return 0;
+          }
+          EOF
+          gcc -I upstream/src/libretro-common/include /tmp/capture.c -ldl -o output/capture-native
+          mipsel-linux-gnu-gcc -I upstream/src/libretro-common/include -march=mips32r2 -mabi=32 -mhard-float -mfp32 /tmp/capture.c -ldl -o output/capture-mips
+          cp /tmp/capture.c output/
+          printf '%s\n' 'Run locally with a user-supplied btoads.zip; no ROM is stored in this repository.' > output/README.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: av-diagnostic-tools
+          path: output/
