@@ -1,0 +1,35 @@
+name: Experimental MAME 2003 MIPS build
+on:
+  push:
+    paths:
+      - '.github/workflows/build-mips.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      - name: Install cross compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-mipsel-linux-gnu binutils-mipsel-linux-gnu libc6-dev-mipsel-cross
+      - name: Fetch upstream
+        run: |
+          git clone --depth 1 https://github.com/libretro/mame2003-libretro.git upstream
+          git -C upstream rev-parse HEAD
+      - name: Compile baseline
+        run: |
+          make -C upstream -j2 platform=unix ARCH=mips CPU_ARCH=mips CC='mipsel-linux-gnu-gcc -march=mips32r2 -mabi=32 -mhard-float -mfp32 -fcommon -static-libgcc' AR=mipsel-linux-gnu-ar
+      - name: Inspect binary
+        run: |
+          mkdir -p output
+          cp upstream/mame2003_libretro.so output/
+          git -C upstream rev-parse HEAD > output/source-commit.txt
+          mipsel-linux-gnu-readelf -h -A -d -V -Ws output/mame2003_libretro.so > output/elf-report.txt
+          grep -E 'GLIBC_[0-9]' output/elf-report.txt | sort -u | head -100
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mame2003-mips-baseline-NOT-FOR-INSTALL
+          path: output/
