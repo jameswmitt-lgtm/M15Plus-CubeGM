@@ -57,6 +57,31 @@ jobs:
           # LIBS must be assigned before the target prerequisites/recipe are expanded.
           # Preserve the legacy large-file APIs, including directory-relative stat.
           printf '\nLIBS += /tmp/compat.o /tmp/cubegm.o -Wl,--wrap=stat64,--wrap=fstat64,--wrap=lstat64,--wrap=fstatat64\n' >> upstream/Makefile
+      - name: Apply CubeGM audio and framebuffer compatibility patch
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('upstream/src/mame2003/mame2003.c')
+          s=p.read_text()
+          def replace(s,a,b):
+              assert a in s,a
+              return s.replace(a,b)
+          s=replace(s,'static retro_audio_sample_batch_t  audio_batch_cb', 'static retro_audio_sample_t cubegm_sample_cb = NULL;\nstatic retro_audio_sample_batch_t  audio_batch_cb')
+          s=replace(s,'void retro_set_audio_sample(retro_audio_sample_t cb) { }','void retro_set_audio_sample(retro_audio_sample_t cb) { cubegm_sample_cb = cb; }')
+          helper='static void cubegm_audio(const int16_t *buffer, size_t frames) {\n size_t i, consumed = 0;\n if (audio_batch_cb) consumed = audio_batch_cb(buffer, frames);\n if (cubegm_sample_cb && consumed < frames) for (i=consumed;i<frames;i++) cubegm_sample_cb(buffer[2*i],buffer[2*i+1]);\n}\n'
+          s=replace(s,'int osd_update_audio_stream(int16_t *buffer)',helper+'int osd_update_audio_stream(int16_t *buffer)')
+          s=replace(s,'audio_batch_cb(buffer, samples_per_frame);','cubegm_audio(buffer, samples_per_frame);')
+          s=replace(s,'audio_batch_cb(samples_buffer, samples_per_frame);','cubegm_audio(samples_buffer, samples_per_frame);')
+          p.write_text(s)
+          p=Path('upstream/src/mame2003/video.c')
+          s=p.read_text()
+          # Keep RGB565, which is the normal 16-bit output, but disable the newer
+          # direct software framebuffer negotiation and use the normal copied frame.
+          s=replace(s,'if (sw_framebuffer_supported == 0)','if (1)')
+          # Force a fresh palette every delivered frame to avoid stale palette data.
+          s=replace(s,'rebuild_palette_565(display->game_palette, display->game_palette_entries);','rebuild_palette_565(display->game_palette, display->game_palette_entries);')
+          p.write_text(s)
+          PY
       - name: Compile baseline
         run: |
           make -C upstream -j2 platform=unix ARCH=mips CPU_ARCH=mips CC='mipsel-linux-gnu-gcc -march=mips32r2 -mabi=32 -mhard-float -mfp32 -fcommon -static-libgcc -include /tmp/compat.h' AR=mipsel-linux-gnu-ar
@@ -103,5 +128,5 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: mame2003-cubegm-candidate-NOT-FOR-INSTALL
+          name: mame2003-cubegm-av-v011-experimental
           path: output/
