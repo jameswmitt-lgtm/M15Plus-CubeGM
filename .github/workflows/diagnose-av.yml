@@ -1,4 +1,4 @@
-name: Diagnose Battletoads AV
+name: Diagnose Battletoads AV and shutdown
 on:
   push:
     paths: ['.github/workflows/diagnose-av.yml']
@@ -13,7 +13,7 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-mipsel-linux-gnu libc6-dev-mipsel-cross qemu-user
+          sudo apt-get install -y gcc-mipsel-linux-gnu libc6-dev-mipsel-cross qemu-user-static
       - name: Fetch pinned upstream
         run: |
           git clone https://github.com/libretro/mame2003-libretro.git upstream
@@ -77,22 +77,29 @@ jobs:
           static int16_t input(unsigned p,unsigned d,unsigned i,unsigned id){(void)i;if(p||d!=RETRO_DEVICE_JOYPAD)return 0;return (id==RETRO_DEVICE_ID_JOYPAD_SELECT && frame>=600&&frame<610)||(id==RETRO_DEVICE_ID_JOYPAD_START&&frame>=660&&frame<670)||(id==RETRO_DEVICE_ID_JOYPAD_B&&frame>700&&frame%30<10);}
           #define LOAD(name,type) type name = dlsym(h,#name); if(!name){fprintf(stderr,"missing %s\n",#name);return 2;}
           int main(int argc,char **argv){
-            if(argc!=3)return 1;
+            if(argc<3||argc>4)return 1;
+            setvbuf(stdout,NULL,_IONBF,0);
             void *h=dlopen(argv[1],RTLD_NOW|RTLD_LOCAL);if(!h){fprintf(stderr,"%s\n",dlerror());return 2;}
             typedef void(*voidfn)(void);typedef void(*envfn)(retro_environment_t);typedef void(*vidfn)(retro_video_refresh_t);typedef void(*audfn)(retro_audio_sample_t);typedef void(*batchfn)(retro_audio_sample_batch_t);typedef void(*pollfn)(retro_input_poll_t);typedef void(*inputfn)(retro_input_state_t);typedef bool(*loadfn)(const struct retro_game_info*);typedef void(*avfn)(struct retro_system_av_info*);
             LOAD(retro_set_environment,envfn);LOAD(retro_set_video_refresh,vidfn);LOAD(retro_set_audio_sample,audfn);LOAD(retro_set_audio_sample_batch,batchfn);LOAD(retro_set_input_poll,pollfn);LOAD(retro_set_input_state,inputfn);LOAD(retro_init,voidfn);LOAD(retro_load_game,loadfn);LOAD(retro_get_system_av_info,avfn);LOAD(retro_run,voidfn);LOAD(retro_unload_game,voidfn);LOAD(retro_deinit,voidfn);
             retro_set_environment(env);retro_set_video_refresh(video);retro_set_audio_sample(audio);retro_set_audio_sample_batch(batch);retro_set_input_poll(poll);retro_set_input_state(input);retro_init();
             struct retro_game_info game={.path=argv[2]};if(!retro_load_game(&game)){fprintf(stderr,"ROM load failed\n");return 3;}
             struct retro_system_av_info av={0};retro_get_system_av_info(&av);printf("fps=%f sample_rate=%f\n",av.timing.fps,av.timing.sample_rate);
-            pcm=fopen("audio.s16le","wb");for(frame=0;frame<1800;frame++)retro_run();if(pcm)fclose(pcm);
+            pcm=fopen("audio.s16le","wb");for(frame=0;frame<(argc==4?(unsigned)atoi(argv[3]):1800);frame++)retro_run();if(pcm)fclose(pcm);
             printf("video_frames=%u audio_frames=%llu nonzero_samples=%llu\n",video_frames,samples,nonzero);
-            retro_unload_game();retro_deinit();return 0;
+            puts("BEGIN retro_unload_game");retro_unload_game();puts("END retro_unload_game");
+            puts("BEGIN retro_deinit");retro_deinit();puts("END retro_deinit");
+            puts("BEGIN dlclose");if(dlclose(h))return 4;puts("END dlclose");return 0;
           }
           EOF
           gcc -I upstream/src/libretro-common/include /tmp/capture.c -ldl -o output/capture-native
           mipsel-linux-gnu-gcc -I upstream/src/libretro-common/include -march=mips32r2 -mabi=32 -mhard-float -mfp32 /tmp/capture.c -ldl -o output/capture-mips
           cp /tmp/capture.c output/
           printf '%s\n' 'Run locally with a user-supplied btoads.zip; no ROM is stored in this repository.' > output/README.txt
+      - name: Bundle MIPS runtime for private ROM testing locally
+        run: |
+          cp /usr/bin/qemu-mipsel-static output/
+          tar -czf output/mips-sysroot.tar.gz -C /usr/mipsel-linux-gnu lib
       - uses: actions/upload-artifact@v4
         with:
           name: av-diagnostic-tools
