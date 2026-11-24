@@ -18,6 +18,7 @@ jobs:
       - name: Fetch upstream
         run: |
           git clone --depth 1 https://github.com/libretro/mame2003-libretro.git upstream
+          git -C upstream rev-parse HEAD | grep '^6db8b53'
           git -C upstream rev-parse HEAD
       - name: Add compatibility symbol aliases
         run: |
@@ -42,9 +43,20 @@ jobs:
           int __wrap_fstatat64(int fd, const char *p, struct stat64 *s, int flags) { return __fxstatat64(3,fd,p,s,flags); }
           EOF
           mipsel-linux-gnu-gcc -march=mips32r2 -mabi=32 -mhard-float -mfp32 -fPIC -c /tmp/compat.c -o /tmp/compat.o
+          # CubeGM capcom reference returns zero from retro_is_support.
+          # Progress hook is optional; retain the pointer without invoking an unverified ABI.
+          cat > /tmp/cubegm.c <<'EOF'
+          #include <stddef.h>
+          int retro_is_support(const char *path) { (void)path; return 0; }
+          static void (*volatile progress_callback)(void);
+          void retro_set_progress_callback(void (*callback)(void)) { progress_callback = callback; }
+          EOF
+          mipsel-linux-gnu-gcc -march=mips32r2 -mabi=32 -mhard-float -mfp32 -fPIC -c /tmp/cubegm.c -o /tmp/cubegm.o
+          cat upstream/link.T
+          grep -q 'retro_\*' upstream/link.T || sed -i '/global:/a\    retro_is_support; retro_set_progress_callback;' upstream/link.T
           # LIBS must be assigned before the target prerequisites/recipe are expanded.
           # Preserve the legacy large-file APIs, including directory-relative stat.
-          printf '\nLIBS += /tmp/compat.o -Wl,--wrap=stat64,--wrap=fstat64,--wrap=lstat64,--wrap=fstatat64\n' >> upstream/Makefile
+          printf '\nLIBS += /tmp/compat.o /tmp/cubegm.o -Wl,--wrap=stat64,--wrap=fstat64,--wrap=lstat64,--wrap=fstatat64\n' >> upstream/Makefile
       - name: Compile baseline
         run: |
           make -C upstream -j2 platform=unix ARCH=mips CPU_ARCH=mips CC='mipsel-linux-gnu-gcc -march=mips32r2 -mabi=32 -mhard-float -mfp32 -fcommon -static-libgcc -include /tmp/compat.h' AR=mipsel-linux-gnu-ar
@@ -57,8 +69,39 @@ jobs:
           mipsel-linux-gnu-readelf --dyn-syms --wide output/mame2003_libretro.so | grep -E 'GLIBC_2\.(2[1-9]|[3-9][0-9])' || true
           grep -oE 'GLIBC_[0-9]+(\.[0-9]+)+' output/elf-report.txt | sort -Vu
           if grep -oE 'GLIBC_[0-9]+(\.[0-9]+)+' output/elf-report.txt | sort -Vu | awk -F'[_.]' '$2>2 || ($2==2 && $3>20) {bad=1} END {exit !bad}'; then echo 'Newer glibc symbols remain'; exit 1; fi
+      - name: Verify core loading in MIPS userspace
+        run: |
+          cat > /tmp/smoke.c <<'EOF'
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <dlfcn.h>
+          #include <sys/stat.h>
+          #include <string.h>
+          #include "libretro.h"
+          int main(int argc, char **argv) {
+            if (argc != 2) return 1;
+            void *h = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
+            if (!h) { fprintf(stderr,"%s\n",dlerror()); return 2; }
+            const char *names[]={"retro_api_version","retro_get_system_info","retro_init","retro_run","retro_load_game","retro_is_support","retro_set_progress_callback","retro_set_environment","retro_set_video_refresh","retro_set_audio_sample","retro_set_audio_sample_batch","retro_set_input_poll","retro_set_input_state"};
+            for (unsigned i=0;i<sizeof(names)/sizeof(names[0]);i++) if(!dlsym(h,names[i])) { fprintf(stderr,"missing %s\n",names[i]); return 3; }
+            unsigned (*version)(void)=dlsym(h,"retro_api_version");
+            void (*info)(struct retro_system_info *)=dlsym(h,"retro_get_system_info");
+            struct retro_system_info x={0};
+            info(&x);
+            printf("API %u, core %s %s, extensions %s\n",version(),x.library_name,x.library_version,x.valid_extensions);
+            if(version()!=1) return 4;
+            int (*support)(const char *)=dlsym(h,"retro_is_support");
+            if(support("btoads.zip")!=0) return 5;
+            dlclose(h);
+            return 0;
+          }
+          EOF
+          mipsel-linux-gnu-gcc -march=mips32r2 -mabi=32 -mhard-float -mfp32 -I upstream/src/libretro-common/include /tmp/smoke.c -ldl -o /tmp/smoke
+          qemu-mipsel -cpu 74Kf -L /usr/mipsel-linux-gnu /tmp/smoke "$PWD/output/mame2003_libretro.so"
+          mipsel-linux-gnu-readelf -Ws output/mame2003_libretro.so | grep -w driver_btoads > output/btoads-driver.txt
+          cp output/mame2003_libretro.so output/libemu_btoads.so
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: mame2003-mips-compat-experiment-NOT-FOR-INSTALL
+          name: mame2003-cubegm-candidate-NOT-FOR-INSTALL
           path: output/
