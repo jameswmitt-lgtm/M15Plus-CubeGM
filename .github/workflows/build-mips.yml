@@ -14,22 +14,42 @@ jobs:
       - name: Install cross compiler
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-mipsel-linux-gnu binutils-mipsel-linux-gnu libc6-dev-mipsel-cross
+          sudo apt-get install -y gcc-mipsel-linux-gnu binutils-mipsel-linux-gnu libc6-dev-mipsel-cross qemu-user
       - name: Fetch upstream
         run: |
           git clone --depth 1 https://github.com/libretro/mame2003-libretro.git upstream
           git -C upstream rev-parse HEAD
+      - name: Add compatibility symbol aliases
+        run: |
+          cat > /tmp/compat.h <<'EOF'
+          __asm__(".symver exp,exp@GLIBC_2.0");
+          __asm__(".symver pow,pow@GLIBC_2.0");
+          __asm__(".symver log,log@GLIBC_2.0");
+          EOF
+          # Use the legacy stat entry points exported by glibc before 2.33.
+          cat > /tmp/compat.c <<'EOF'
+          #define _LARGEFILE64_SOURCE
+          #include <sys/stat.h>
+          extern int __xstat64(int, const char *, struct stat64 *);
+          extern int __fxstat64(int, int, struct stat64 *);
+          int __wrap_stat64(const char *p, struct stat64 *s) { return __xstat64(3,p,s); }
+          int __wrap_fstat64(int fd, struct stat64 *s) { return __fxstat64(3,fd,s); }
+          EOF
+          mipsel-linux-gnu-gcc -march=mips32r2 -mabi=32 -mhard-float -mfp32 -fPIC -c /tmp/compat.c -o /tmp/compat.o
+          printf '\nLIBS += /tmp/compat.o -Wl,--wrap=stat64,--wrap=fstat64\n' >> upstream/Makefile
       - name: Compile baseline
         run: |
-          make -C upstream -j2 platform=unix ARCH=mips CPU_ARCH=mips CC='mipsel-linux-gnu-gcc -march=mips32r2 -mabi=32 -mhard-float -mfp32 -fcommon -static-libgcc' AR=mipsel-linux-gnu-ar
+          make -C upstream -j2 platform=unix ARCH=mips CPU_ARCH=mips CC='mipsel-linux-gnu-gcc -march=mips32r2 -mabi=32 -mhard-float -mfp32 -fcommon -static-libgcc -include /tmp/compat.h' AR=mipsel-linux-gnu-ar
       - name: Inspect binary
         run: |
           mkdir -p output
           cp upstream/mame2003_libretro.so output/
           git -C upstream rev-parse HEAD > output/source-commit.txt
           mipsel-linux-gnu-readelf -h -A -d -V -Ws output/mame2003_libretro.so > output/elf-report.txt
-          grep -E 'GLIBC_[0-9]' output/elf-report.txt | sort -u | head -100
+          grep -oE 'GLIBC_[0-9]+(\.[0-9]+)+' output/elf-report.txt | sort -Vu
+          if grep -oE 'GLIBC_[0-9]+(\.[0-9]+)+' output/elf-report.txt | sort -Vu | awk -F'[_.]' '$2>2 || ($2==2 && $3>20) {bad=1} END {exit !bad}'; then echo 'Newer glibc symbols remain'; exit 1; fi
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
-          name: mame2003-mips-baseline-NOT-FOR-INSTALL
+          name: mame2003-mips-compat-experiment-NOT-FOR-INSTALL
           path: output/
