@@ -155,6 +155,12 @@ jobs:
           once('bool retro_serialize(void *data, size_t size)\n{','bool retro_serialize(void *data, size_t size)\n{\n    cubegm_exit_trace("SERIALIZE begin");')
           once('state_save_save_finish();','state_save_save_finish();\n        cubegm_exit_trace("SERIALIZE finish");')
           once('void retro_reset (void)\n{','void retro_reset (void)\n{\n    cubegm_exit_trace("RESET begin");')
+          # Keep declarations before statements for the upstream C90 build.
+          decl='  int              driverIndex    = 0;\n  char             *driver_lookup = NULL;'
+          assert s.count(decl)==1
+          s=s.replace(decl,'')
+          s=s.replace('bool retro_load_game(const struct retro_game_info *game)\n{','bool retro_load_game(const struct retro_game_info *game)\n{\n'+decl)
+          once('    cubegm_exit_trace("SERIALIZE begin");\n   int cpunum;','   int cpunum;\n    cubegm_exit_trace("SERIALIZE begin");')
           p.write_text(s)
           p=Path('upstream/src/mame.c')
           s=p.read_text()
