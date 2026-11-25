@@ -1,0 +1,272 @@
+name: Battletoads audio regression v020
+on:
+  push:
+    paths:
+      - '.github/workflows/audio-regression-v020.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        rate: [44100, 0]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      - name: Install cross compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-mipsel-linux-gnu binutils-mipsel-linux-gnu libc6-dev-mipsel-cross qemu-user
+      - name: Fetch upstream
+        run: |
+          git clone --depth 1 https://github.com/libretro/mame2003-libretro.git upstream
+          git -C upstream rev-parse HEAD | grep '^6db8b53'
+          git -C upstream rev-parse HEAD
+      - name: Add compatibility symbol aliases
+        run: |
+          cat > /tmp/compat.h <<'EOF'
+          __asm__(".symver exp,exp@GLIBC_2.0");
+          __asm__(".symver pow,pow@GLIBC_2.0");
+          __asm__(".symver log,log@GLIBC_2.0");
+          EOF
+          # Use the legacy stat entry points exported by glibc before 2.33.
+          cat > /tmp/compat.c <<'EOF'
+          #define _LARGEFILE64_SOURCE
+          #include <sys/stat.h>
+          extern int __xstat64(int, const char *, struct stat64 *);
+          extern int __fxstat64(int, int, struct stat64 *);
+          int __wrap_stat64(const char *p, struct stat64 *s) { return __xstat64(3,p,s); }
+          int __wrap_fstat64(int fd, struct stat64 *s) { return __fxstat64(3,fd,s); }
+          EOF
+          cat >> /tmp/compat.c <<'EOF'
+          extern int __lxstat64(int, const char *, struct stat64 *);
+          extern int __fxstatat64(int, int, const char *, struct stat64 *, int);
+          int __wrap_lstat64(const char *p, struct stat64 *s) { return __lxstat64(3,p,s); }
+          int __wrap_fstatat64(int fd, const char *p, struct stat64 *s, int flags) { return __fxstatat64(3,fd,p,s,flags); }
+          EOF
+          mipsel-linux-gnu-gcc -march=mips32r2 -mabi=32 -mhard-float -mfp32 -fPIC -c /tmp/compat.c -o /tmp/compat.o
+          # CubeGM capcom reference returns zero from retro_is_support.
+          # Progress hook is optional; retain the pointer without invoking an unverified ABI.
+          cat > /tmp/cubegm.c <<'EOF'
+          #include <stddef.h>
+          int retro_is_support(const char *path) { (void)path; return 0; }
+          static void (*volatile progress_callback)(void);
+          void retro_set_progress_callback(void (*callback)(void)) { progress_callback = callback; }
+          EOF
+          mipsel-linux-gnu-gcc -march=mips32r2 -mabi=32 -mhard-float -mfp32 -fPIC -c /tmp/cubegm.c -o /tmp/cubegm.o
+          cat upstream/link.T
+          grep -q 'retro_\*' upstream/link.T || sed -i '/global:/a\    retro_is_support; retro_set_progress_callback;' upstream/link.T
+          # LIBS must be assigned before the target prerequisites/recipe are expanded.
+          # Preserve the legacy large-file APIs, including directory-relative stat.
+          printf '\nLIBS += /tmp/compat.o /tmp/cubegm.o -Wl,--wrap=stat64,--wrap=fstat64,--wrap=lstat64,--wrap=fstatat64\n' >> upstream/Makefile
+      - name: Initialize critical options even on minimal frontends
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('upstream/src/mame2003/core_options.c')
+          s=p.read_text()
+          old='  bool reset_control_descriptions = false;'
+          new=old+'''
+          if (first_time)
+          {
+            options.samplerate = ${{ matrix.rate }};
+            options.brightness = 1.0;
+            options.gamma = 1.0;
+          }
+          '''
+          assert s.count(old)==1
+          p.write_text(s.replace(old,new))
+          PY
+      - name: Hard-disable player three at emulated hardware boundary
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('upstream/src/drivers/btoads.c')
+          s=p.read_text()
+          def once(a,b):
+              global s
+              assert s.count(a)==1,a
+              s=s.replace(a,b)
+          marker='static MEMORY_READ16_START( main_readmem )'
+          once(marker,'''/* P3 controls are active-low: force all lines inactive regardless
+             of frontend mapping or saved input configuration. */
+          static READ16_HANDLER( cubegm_p3_disabled_r )
+          {
+             (void)offset; (void)mem_mask;
+             return 0xffff;
+          }
+          /* Preserve every other DIP switch, force two-player cabinet. */
+          static READ16_HANDLER( cubegm_two_player_dip_r )
+          {
+             (void)offset; (void)mem_mask;
+             return readinputport(5) | 0x0008;
+          }
+
+          '''+marker)
+          once('TOBYTE(0x2000017f), input_port_2_word_r','TOBYTE(0x2000017f), cubegm_p3_disabled_r')
+          once('TOBYTE(0x200002ff), input_port_5_word_r','TOBYTE(0x200002ff), cubegm_two_player_dip_r')
+          once('PORT_DIPNAME( 0x0008, 0x0000, "Three Players")','PORT_DIPNAME( 0x0008, 0x0008, "Three Players")')
+          p.write_text(s)
+          PY
+      - name: Adapt geometry notification to legacy CubeGM ABI
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('upstream/src/mame2003/video.c')
+          s=p.read_text()
+          old='   struct retro_game_geometry geom = { 0 };'
+          assert s.count(old)==1
+          s=s.replace(old,'''   /* SEGAM_066_EM CubeGM command 37 writes a double at data+32.
+                Back the geometry argument with an entire aligned AV structure.
+                The standard geometry layout remains at offset zero. */
+             struct retro_system_av_info av = { 0 };''')
+          old='   mame2003_video_get_geometry(&geom);\n   environ_cb(RETRO_ENVIRONMENT_SET_GEOMETRY, &geom);'
+          assert s.count(old)==1
+          s=s.replace(old,'   mame2003_video_get_geometry(&av.geometry);\n   environ_cb(RETRO_ENVIRONMENT_SET_GEOMETRY, &av.geometry);')
+          p.write_text(s)
+          PY
+      - name: Regression check legacy callback memory boundary in MIPS
+        run: |
+          cat > /tmp/geometry-test.c <<'EOF'
+          #include <stddef.h>
+          #include <stdint.h>
+          #include <stdio.h>
+          #include <string.h>
+          #include "libretro.h"
+          static void legacy(unsigned cmd, void *p) {
+            double rate=44100.0;
+            if(cmd==37) memcpy((char *)p+32,&rate,8);
+          }
+          int main(void) {
+            struct { struct retro_system_av_info av; uint64_t guard; } safe = {0};
+            struct { struct retro_game_geometry geom; unsigned char guard[32]; } old = {0};
+            if(offsetof(struct retro_system_av_info,geometry)!=0 || sizeof(safe.av)<40 || sizeof(old.geom)!=20) return 1;
+            memset(old.guard,0xa5,sizeof(old.guard));
+            legacy(37,&old.geom);
+            if(old.guard[12]==0xa5 && old.guard[13]==0xa5 && old.guard[14]==0xa5 && old.guard[15]==0xa5) return 2;
+            safe.guard=0x123456789abcdef0ULL;
+            safe.av.geometry.base_width=512;
+            safe.av.geometry.base_height=224;
+            legacy(37,&safe.av.geometry);
+            if(safe.guard!=0x123456789abcdef0ULL || safe.av.timing.sample_rate!=44100.0 || safe.av.geometry.base_width!=512 || safe.av.geometry.base_height!=224) return 3;
+            puts("Legacy command 37 reproduced: old argument overruns; full AV argument protects adjacent memory");
+            return 0;
+          }
+          EOF
+          mipsel-linux-gnu-gcc -march=mips32r2 -mabi=32 -mhard-float -mfp32 -I upstream/src/libretro-common/include /tmp/geometry-test.c -o /tmp/geometry-test
+          qemu-mipsel -cpu 74Kf -L /usr/mipsel-linux-gnu /tmp/geometry-test
+      - name: Trace shutdown and frontend calls to ROM directory
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('upstream/src/mame2003/mame2003.c')
+          s=p.read_text()
+          def once(a,b):
+              global s
+              assert s.count(a)==1,a
+              s=s.replace(a,b)
+          marker='bool retro_load_game(const struct retro_game_info *game)'
+          once(marker,'''#include <unistd.h>
+          static char trace_path[4096];
+          void cubegm_exit_trace(const char *msg)
+          {
+             FILE *f;
+             if (!trace_path[0]) return;
+             f=fopen(trace_path,"a");
+             if(!f) return;
+             fprintf(f,"%s\\n",msg);
+             fflush(f);
+             fsync(fileno(f));
+             fclose(f);
+          }
+          '''+marker)
+          once(marker+'\n{',marker+'''
+          {
+             if(game && game->path)
+             {
+                const char *slash=strrchr(game->path,'/');
+                size_t n=slash?(size_t)(slash-game->path+1):0;
+                if(n+sizeof("btoads-exit.log")<=sizeof(trace_path))
+                {
+                   FILE *f;
+                   memcpy(trace_path,game->path,n);
+                   strcpy(trace_path+n,"btoads-exit.log");
+                   f=fopen(trace_path,"w"); if(f) fclose(f);
+                   cubegm_exit_trace("LOAD begin");
+                }
+             }
+          ''')
+          once('void retro_unload_game(void)\n{','void retro_unload_game(void)\n{\n    cubegm_exit_trace("UNLOAD begin");')
+          once('    mame_done();','    mame_done();\n    cubegm_exit_trace("UNLOAD mame_done returned");')
+          once('    options.libretro_save_path    = NULL;','    options.libretro_save_path    = NULL;\n    cubegm_exit_trace("UNLOAD end");')
+          once('void retro_deinit(void)\n{','void retro_deinit(void)\n{\n    cubegm_exit_trace("DEINIT begin");')
+          once('   perf_cb.perf_log();\n#endif\n}','   perf_cb.perf_log();\n#endif\n    cubegm_exit_trace("DEINIT end");\n}')
+          once('bool retro_serialize(void *data, size_t size)\n{','bool retro_serialize(void *data, size_t size)\n{\n    cubegm_exit_trace("SERIALIZE begin");')
+          once('state_save_save_finish();','state_save_save_finish();\n        cubegm_exit_trace("SERIALIZE finish");')
+          once('void retro_reset (void)\n{','void retro_reset (void)\n{\n    cubegm_exit_trace("RESET begin");')
+          # Keep declarations before statements for the upstream C90 build.
+          decl='  int              driverIndex    = 0;\n  char             *driver_lookup = NULL;'
+          assert s.count(decl)==1
+          s=s.replace(decl,'')
+          s=s.replace('bool retro_load_game(const struct retro_game_info *game)\n{','bool retro_load_game(const struct retro_game_info *game)\n{\n'+decl)
+          once('    cubegm_exit_trace("SERIALIZE begin");\n   int cpunum;','   int cpunum;\n    cubegm_exit_trace("SERIALIZE begin");')
+          p.write_text(s)
+          p=Path('upstream/src/mame.c')
+          s=p.read_text()
+          marker='void mame_done(void)'
+          once(marker,'extern void cubegm_exit_trace(const char *msg);\n'+marker)
+          for fn in ['cpu_run_done','run_machine_core_done','run_machine_done','run_game_done']:
+              old='        '+fn+'();'
+              once(old,'        cubegm_exit_trace("MAME '+fn+' begin");\n'+old+'\n        cubegm_exit_trace("MAME '+fn+' end");')
+          p.write_text(s)
+          PY
+      - name: Compile baseline
+        run: |
+          make -C upstream -j2 platform=unix ARCH=mips CPU_ARCH=mips CC='mipsel-linux-gnu-gcc -march=mips32r2 -mabi=32 -mhard-float -mfp32 -fcommon -static-libgcc -include /tmp/compat.h' AR=mipsel-linux-gnu-ar
+      - name: Inspect binary
+        run: |
+          mkdir -p output
+          cp upstream/mame2003_libretro.so output/
+          git -C upstream rev-parse HEAD > output/source-commit.txt
+          mipsel-linux-gnu-readelf -h -A -d -V -Ws output/mame2003_libretro.so > output/elf-report.txt
+          mipsel-linux-gnu-readelf --dyn-syms --wide output/mame2003_libretro.so | grep -E 'GLIBC_2\.(2[1-9]|[3-9][0-9])' || true
+          grep -oE 'GLIBC_[0-9]+(\.[0-9]+)+' output/elf-report.txt | sort -Vu
+          if grep -oE 'GLIBC_[0-9]+(\.[0-9]+)+' output/elf-report.txt | sort -Vu | awk -F'[_.]' '$2>2 || ($2==2 && $3>20) {bad=1} END {exit !bad}'; then echo 'Newer glibc symbols remain'; exit 1; fi
+      - name: Verify core loading in MIPS userspace
+        run: |
+          cat > /tmp/smoke.c <<'EOF'
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <dlfcn.h>
+          #include <sys/stat.h>
+          #include <string.h>
+          #include "libretro.h"
+          int main(int argc, char **argv) {
+            if (argc != 2) return 1;
+            void *h = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
+            if (!h) { fprintf(stderr,"%s\n",dlerror()); return 2; }
+            const char *names[]={"retro_api_version","retro_get_system_info","retro_init","retro_run","retro_load_game","retro_is_support","retro_set_progress_callback","retro_set_environment","retro_set_video_refresh","retro_set_audio_sample","retro_set_audio_sample_batch","retro_set_input_poll","retro_set_input_state"};
+            for (unsigned i=0;i<sizeof(names)/sizeof(names[0]);i++) if(!dlsym(h,names[i])) { fprintf(stderr,"missing %s\n",names[i]); return 3; }
+            unsigned (*version)(void)=dlsym(h,"retro_api_version");
+            void (*info)(struct retro_system_info *)=dlsym(h,"retro_get_system_info");
+            struct retro_system_info x={0};
+            info(&x);
+            printf("API %u, core %s %s, extensions %s\n",version(),x.library_name,x.library_version,x.valid_extensions);
+            if(version()!=1) return 4;
+            int (*support)(const char *)=dlsym(h,"retro_is_support");
+            if(support("btoads.zip")!=0) return 5;
+            dlclose(h);
+            return 0;
+          }
+          EOF
+          mipsel-linux-gnu-gcc -march=mips32r2 -mabi=32 -mhard-float -mfp32 -I upstream/src/libretro-common/include /tmp/smoke.c -ldl -o /tmp/smoke
+          qemu-mipsel -cpu 74Kf -L /usr/mipsel-linux-gnu /tmp/smoke "$PWD/output/mame2003_libretro.so"
+          mipsel-linux-gnu-readelf -Ws output/mame2003_libretro.so | grep -w driver_btoads > output/btoads-driver.txt
+          cp output/mame2003_libretro.so output/libemu_btoads.so
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mame2003-cubegm-v020-audio-${{ matrix.rate }}
+          path: output/
